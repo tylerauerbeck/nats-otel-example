@@ -12,10 +12,12 @@ import (
 	"go.infratographer.com/x/gidx"
 
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 )
 
 var (
@@ -24,22 +26,21 @@ var (
 	kickflipTracer = otel.Tracer("kickflip")
 )
 
-func init() {
-	initTracer()
-}
+const serviceName = "nats-example"
 
 func main() {
-
 	ctx := context.Background()
+	{
+		tp, err := initTracer(ctx, serviceName)
+		if err != nil {
+			panic(err)
+		}
+		defer tp.Shutdown(ctx)
+	}
 
 	publish(ctx)
 
-	fmt.Println("Sleeping for 5 seconds")
-	time.Sleep(5 * time.Second)
-	fmt.Println("Done")
-
-	consume()
-
+	consume(ctx)
 }
 
 func publish(ctx context.Context) {
@@ -76,8 +77,9 @@ func publish(ctx context.Context) {
 
 }
 
-func consume() {
-	ctx := context.Background()
+func consume(ctx context.Context) {
+	// ctx := context.Background()
+	// initTracer()
 
 	sc := events.SubscriberConfig{
 		URL:        "nats://127.0.0.1:4222",
@@ -110,8 +112,10 @@ func consume() {
 
 	fmt.Println(ctx)
 
-	_, span := consumerTracer.Start(ctx, "consume")
-	// _, span := tracer.Start(context.Background(), "consume")
+	// ctx, span := otel.GetTracerProvider().Tracer("consume").Start(ctx, "consume")
+	// ctx, span := consumerTracer.Start(context.Background(), "consume")
+	ctx, span := consumerTracer.Start(ctx, "consume")
+
 	defer span.End()
 
 	fmt.Println(string(receivedMsg.Payload))
@@ -119,26 +123,35 @@ func consume() {
 	doAKickflip(ctx)
 }
 
-func initTracer() {
-
-	ctx := context.Background()
-
-	client := otlptracegrpc.NewClient()
-
-	otlpTraceExporter, err := otlptrace.New(ctx, client)
+func initTracer(ctx context.Context, serviceName string) (*sdktrace.TracerProvider, error) {
+	exporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithEndpoint("147.75.55.123:4317"))
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
-	batchSpanProcessor := trace.NewBatchSpanProcessor(otlpTraceExporter)
-
-	tracerProvider := trace.NewTracerProvider(
-		trace.WithSpanProcessor(batchSpanProcessor),
+	// labels/tags/resources that are common to all traces.
+	resource := resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceNameKey.String(serviceName),
+		attribute.String("some-attribute", "some-value"),
 	)
 
-	otel.SetTracerProvider(tracerProvider)
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{}, propagation.Baggage{}))
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(resource),
+		// set the sampling rate based on the parent span to 60%
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(0.6))),
+	)
+
+	otel.SetTracerProvider(provider)
+
+	otel.SetTextMapPropagator(
+		propagation.NewCompositeTextMapPropagator(
+			propagation.TraceContext{}, // W3C Trace Context format; https://www.w3.org/TR/trace-context/
+		),
+	)
+
+	return provider, nil
 }
 
 func getSingleMessage(messages <-chan *message.Message, timeout time.Duration) (*message.Message, error) {
@@ -151,7 +164,7 @@ func getSingleMessage(messages <-chan *message.Message, timeout time.Duration) (
 }
 
 func doAKickflip(ctx context.Context) {
-	_, span := kickflipTracer.Start(context.Background(), "kickflip")
+	_, span := kickflipTracer.Start(ctx, "kickflip")
 	defer span.End()
 
 	fmt.Println("Kickflipped!")
